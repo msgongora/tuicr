@@ -122,9 +122,11 @@ pub(crate) fn parse_batched_files(output: &str) -> HashMap<PathBuf, String> {
 /// from the working tree on disk instead of calling `fetch_batch`. The
 /// `fetch_batch` closure is the backend-specific batched-fetch primitive
 /// (`hg cat -r REV ...` or `jj file show -r REV ...`).
+///
+/// `old_rev = None` skips the old side (a jj merge has no single base).
 pub(crate) fn apply_container_full_file_highlight<F>(
     root: &Path,
-    old_rev: &str,
+    old_rev: Option<&str>,
     new_rev: Option<&str>,
     files: &mut [DiffFile],
     highlighter: &SyntaxHighlighter,
@@ -140,7 +142,10 @@ where
         return Ok(());
     }
 
-    let old_map = fetch_batch(root, old_rev, &old_paths)?;
+    let old_map = match old_rev {
+        Some(rev) => fetch_batch(root, rev, &old_paths)?,
+        None => HashMap::new(),
+    };
     let new_map = match new_rev {
         Some(rev) => fetch_batch(root, rev, &new_paths)?,
         None => HashMap::new(),

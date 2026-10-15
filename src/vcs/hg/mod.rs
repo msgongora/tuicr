@@ -273,7 +273,7 @@ impl VcsBackend for HgBackend {
         let mut files = self.load_diff(&["diff"], highlighter)?;
         apply_container_full_file_highlight(
             &self.info.root_path,
-            ".",
+            Some("."),
             None,
             &mut files,
             highlighter,
@@ -462,7 +462,7 @@ impl VcsBackend for HgBackend {
         let mut files = self.load_diff(&diff_args, highlighter)?;
         apply_container_full_file_highlight(
             &self.info.root_path,
-            &from_rev,
+            Some(&from_rev),
             Some(newest_short),
             &mut files,
             highlighter,
@@ -570,7 +570,7 @@ impl VcsBackend for HgBackend {
         let mut files = self.load_diff(&diff_args, highlighter)?;
         apply_container_full_file_highlight(
             &self.info.root_path,
-            &from_rev,
+            Some(&from_rev),
             None,
             &mut files,
             highlighter,

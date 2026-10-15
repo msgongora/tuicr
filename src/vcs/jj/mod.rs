@@ -181,6 +181,35 @@ impl JjBackend {
         let patches = pair_metadata_with_patch(metadata, patch.as_bytes())?;
         diff_parser::parse_file_patches(patches, highlighter)
     }
+
+    /// Diff `commit_ids` (oldest first) through `target`. Also returns the
+    /// old-side revision when it is a single one.
+    ///
+    /// `--from <oldest>-` needs exactly one parent; jj rejects it for a merge
+    /// and for the root. Then diff with `-r connected(...)`, which bases a
+    /// merge on the automatic merge of its parents like `jj show`. `-r` is not
+    /// the default because it rejects a merge whose other parent is outside
+    /// the range ("gaps").
+    fn load_range_diff(
+        &self,
+        commit_ids: &[String],
+        target: &str,
+        highlighter: &SyntaxHighlighter,
+    ) -> Result<(Vec<DiffFile>, Option<String>)> {
+        let from_rev = format!("{}-", commit_ids[0]);
+        match self.load_diff(&["diff", "--from", &from_rev, "--to", target], highlighter) {
+            Err(TuicrError::VcsCommand(_)) => {}
+            result => return result.map(|files| (files, Some(from_rev))),
+        }
+
+        let mut revs: Vec<&str> = commit_ids.iter().map(String::as_str).collect();
+        if revs.last() != Some(&target) {
+            revs.push(target);
+        }
+        let revset = format!("connected({})", revs.join(" | "));
+        let files = self.load_diff(&["diff", "-r", &revset], highlighter)?;
+        Ok((files, None))
+    }
 }
 
 const JJ_DIFF_METADATA_TEMPLATE: &str =
@@ -233,11 +262,13 @@ impl VcsBackend for JjBackend {
         let mut files = self.load_diff(&["diff"], highlighter)?;
         apply_container_full_file_highlight(
             &self.info.root_path,
-            "@-",
+            Some("@-"),
             None,
             &mut files,
             highlighter,
-            jj_show_batch,
+            // `@-` is every parent of a merge, which `jj file show` rejects.
+            // Leave the old side uncolored instead of failing the load.
+            |root, rev, paths| Ok(jj_show_batch(root, rev, paths).unwrap_or_default()),
         )?;
         Ok(files)
     }
@@ -393,17 +424,11 @@ impl VcsBackend for JjBackend {
         }
 
         // commit_ids are ordered from oldest to newest
-        let oldest = &commit_ids[0];
         let newest = commit_ids.last().unwrap();
-
-        // Get the parent of the oldest commit to include its changes
-        // In jj, we use {commit}- to get the parent(s)
-        let from_rev = format!("{}-", oldest);
-        let diff_args = ["diff", "--from", &from_rev, "--to", newest];
-        let mut files = self.load_diff(&diff_args, highlighter)?;
+        let (mut files, old_rev) = self.load_range_diff(commit_ids, newest, highlighter)?;
         apply_container_full_file_highlight(
             &self.info.root_path,
-            &from_rev,
+            old_rev.as_deref(),
             Some(newest),
             &mut files,
             highlighter,
@@ -473,15 +498,10 @@ impl VcsBackend for JjBackend {
         }
 
         // commit_ids are ordered from oldest to newest
-        let oldest = &commit_ids[0];
-
-        // Diff from the parent of the oldest commit to the working copy (@)
-        let from_rev = format!("{}-", oldest);
-        let diff_args = ["diff", "--from", &from_rev, "--to", "@"];
-        let mut files = self.load_diff(&diff_args, highlighter)?;
+        let (mut files, old_rev) = self.load_range_diff(commit_ids, "@", highlighter)?;
         apply_container_full_file_highlight(
             &self.info.root_path,
-            &from_rev,
+            old_rev.as_deref(),
             None,
             &mut files,
             highlighter,
@@ -1345,6 +1365,237 @@ mod tests {
                 "vue hunk line {line:?} should have varied fg colors, got {unique_fgs:?}"
             );
         }
+    }
+
+    /// Run `jj` in `root` and return its stdout, failing the test on error.
+    fn jj_ok(root: &Path, args: &[&str]) -> String {
+        let output = jj_cmd()
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("Failed to run jj");
+        assert!(
+            output.status.success(),
+            "jj {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    struct MergeRepo {
+        temp: tempfile::TempDir,
+        base: String,
+        left: String,
+        merge: String,
+    }
+
+    /// `base -> {left, right} -> merge`, with `@` an empty child of the merge.
+    /// The merge edits `doc.mdx` (a container grammar) and adds `merge.txt`.
+    fn setup_merge_repo() -> Option<MergeRepo> {
+        if !jj_available() {
+            return None;
+        }
+
+        let temp = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp.path();
+        jj_ok(root, &["git", "init"]);
+        let parent_id = || jj_ok(root, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]);
+
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        fs::write(root.join("doc.mdx"), "# Notes\n\n<Callout>hi</Callout>\n").unwrap();
+        jj_ok(root, &["commit", "-m", "base"]);
+        let base = parent_id();
+
+        fs::write(root.join("left.txt"), "left\n").unwrap();
+        jj_ok(root, &["commit", "-m", "left"]);
+        let left = parent_id();
+
+        jj_ok(root, &["new", &base]);
+        fs::write(root.join("right.txt"), "right\n").unwrap();
+        jj_ok(root, &["commit", "-m", "right"]);
+        let right = parent_id();
+
+        jj_ok(root, &["new", &left, &right]);
+        fs::write(
+            root.join("doc.mdx"),
+            "# Notes\n\n<Callout>hello</Callout>\n",
+        )
+        .unwrap();
+        fs::write(root.join("merge.txt"), "merge\n").unwrap();
+        jj_ok(root, &["commit", "-m", "merge"]);
+        let merge = parent_id();
+
+        Some(MergeRepo {
+            temp,
+            base,
+            left,
+            merge,
+        })
+    }
+
+    fn sorted_paths(files: &[DiffFile]) -> Vec<String> {
+        let mut paths: Vec<String> = files
+            .iter()
+            .map(|f| f.display_path().to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    fn commit_list(ids: &[&str]) -> ResolvedRevisionRange<'static> {
+        ResolvedRevisionRange::from_owned_commit_ids(
+            ids.iter().map(|id| id.to_string()).collect(),
+            RevisionDiffTarget::CommitList,
+        )
+    }
+
+    #[test]
+    fn test_jj_merge_commit_diff_shows_only_merge_changes() {
+        let Some(repo) = setup_merge_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+        let backend =
+            JjBackend::from_path(repo.temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+                .expect("Failed to create jj backend");
+
+        let files = backend
+            .get_commit_range_diff(&commit_list(&[&repo.merge]), &SyntaxHighlighter::default())
+            .expect("merge commit diff should load");
+        assert_eq!(sorted_paths(&files), ["doc.mdx", "merge.txt"]);
+
+        let added = jj_file(&files, "doc.mdx").unwrap().hunks[0]
+            .lines
+            .iter()
+            .find(|l| l.origin == LineOrigin::Addition)
+            .expect("doc.mdx should have an added line");
+        assert!(
+            added.highlighted_spans.is_some(),
+            "added container line should be colored from the new side: {added:?}"
+        );
+
+        // `--ignore-all-space` is inserted after `diff`, so it must also fit the `-r` form.
+        let ignore_ws = JjBackend::from_path(
+            repo.temp.path().to_path_buf(),
+            DiffWhitespaceMode::IgnoreAll,
+        )
+        .expect("Failed to create jj backend");
+        let files = ignore_ws
+            .get_commit_range_diff(&commit_list(&[&repo.merge]), &SyntaxHighlighter::default())
+            .expect("merge commit diff should load with --ignore-all-space");
+        assert_eq!(sorted_paths(&files), ["doc.mdx", "merge.txt"]);
+    }
+
+    #[test]
+    fn test_jj_range_starting_at_merge() {
+        let Some(repo) = setup_merge_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+        let root = repo.temp.path();
+        fs::write(root.join("child.txt"), "child\n").unwrap();
+        jj_ok(root, &["commit", "-m", "child"]);
+        let child = jj_ok(root, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]);
+        let backend = JjBackend::from_path(root.to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
+
+        let files = backend
+            .get_commit_range_diff(
+                &commit_list(&[&repo.merge, &child]),
+                &SyntaxHighlighter::default(),
+            )
+            .expect("range starting at a merge should load");
+        assert_eq!(sorted_paths(&files), ["child.txt", "doc.mdx", "merge.txt"]);
+    }
+
+    #[test]
+    fn test_jj_range_with_merge_and_one_parent_keeps_from_to_diff() {
+        let Some(repo) = setup_merge_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+        let backend =
+            JjBackend::from_path(repo.temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+                .expect("Failed to create jj backend");
+
+        // `-r` would reject this set (no `right`); `--from base` also lists `right.txt`.
+        let files = backend
+            .get_commit_range_diff(
+                &commit_list(&[&repo.left, &repo.merge]),
+                &SyntaxHighlighter::default(),
+            )
+            .expect("range from a single-parent commit through a merge should load");
+        assert_eq!(
+            sorted_paths(&files),
+            ["doc.mdx", "left.txt", "merge.txt", "right.txt"]
+        );
+    }
+
+    #[test]
+    fn test_jj_working_tree_diff_on_merge_with_container_file() {
+        let Some(repo) = setup_merge_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+        let root = repo.temp.path();
+        jj_ok(root, &["edit", &repo.merge]);
+        let backend = JjBackend::from_path(root.to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
+
+        let files = backend
+            .get_working_tree_diff(&SyntaxHighlighter::default())
+            .expect("merge working copy that edits doc.mdx should load");
+        assert_eq!(sorted_paths(&files), ["doc.mdx", "merge.txt"]);
+    }
+
+    #[test]
+    fn test_jj_working_tree_with_commits_from_merge() {
+        let Some(repo) = setup_merge_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+        let root = repo.temp.path();
+        fs::write(root.join("wip.txt"), "wip\n").unwrap();
+        let backend = JjBackend::from_path(root.to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
+
+        let files = backend
+            .get_working_tree_with_commits_diff(
+                std::slice::from_ref(&repo.merge),
+                &SyntaxHighlighter::default(),
+            )
+            .expect("working copy on top of a merge should load");
+        assert_eq!(sorted_paths(&files), ["doc.mdx", "merge.txt", "wip.txt"]);
+    }
+
+    #[test]
+    fn test_jj_root_commit_range() {
+        let Some(repo) = setup_merge_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+        let root = repo.temp.path();
+        let root_commit = jj_ok(
+            root,
+            &["log", "-r", "root()", "--no-graph", "-T", "commit_id"],
+        );
+        let backend = JjBackend::from_path(root.to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
+
+        let result = backend
+            .get_commit_range_diff(&commit_list(&[&root_commit]), &SyntaxHighlighter::default());
+        assert!(
+            matches!(result, Err(TuicrError::NoChanges)),
+            "jj's empty root commit should have no changes, got {result:?}"
+        );
+
+        let files = backend
+            .get_commit_range_diff(
+                &commit_list(&[&root_commit, &repo.base]),
+                &SyntaxHighlighter::default(),
+            )
+            .expect("range starting at the root commit should load");
+        assert_eq!(sorted_paths(&files), ["base.txt", "doc.mdx"]);
     }
 
     /// Create a repo whose only file lives under a directory with fileset meta
